@@ -28,6 +28,7 @@ app.post(
     express.raw({ type: "image/*", limit: "3mb" }),
     async (req, res) => {
         try {
+            console.log("Received")
             const apiKey = req.headers["x-api-key"] || req.query.apiKey;
             const deviceId =
                 req.headers["x-device-id"] ||
