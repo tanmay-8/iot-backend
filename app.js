@@ -4,12 +4,26 @@ import { v2 as cloudinary } from "cloudinary";
 import streamifier from "streamifier";
 import axios from "axios";
 import cors from "cors";
+import mongoose from "mongoose";
+import Image from "./models/Image.js";
 
 dotenv.config();
+
+// MongoDB (Mongoose) connect
+const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/iot";
+mongoose
+    .connect(MONGODB_URI, {
+        // Mongoose 7+ has sensible defaults; keep options for older compatibility
+    })
+    .then(() => console.log("Connected to MongoDB"))
+    .catch((err) => console.error("MongoDB connection error:", err));
 
 const app = express();
 app.use(cors());
 app.disable("x-powered-by");
+
+// JSON parsing for API responses where needed
+app.use(express.json());
 
 // Cloudinary config
 cloudinary.config({
@@ -21,6 +35,25 @@ cloudinary.config({
 
 // Simple health check
 app.get("/", (req, res) => res.send("ESP32 Upload Server: OK"));
+
+// Return recent saved images (no auth)
+// Query params: ?limit=20&deviceId=esp32-1
+app.get('/images', async (req, res) => {
+    try {
+        const limit = Math.min(100, parseInt(req.query.limit || '20', 10));
+        const filter = {};
+        if (req.query.deviceId) filter.deviceId = req.query.deviceId;
+        const docs = await Image.find(filter)
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .select({ url: 1, deviceId: 1, createdAt: 1, public_id: 1, width:1, height:1, bytes:1 })
+            .lean();
+        return res.json({ ok: true, images: docs });
+    } catch (err) {
+        console.error('GET /images error', err);
+        return res.status(500).json({ ok: false, error: String(err) });
+    }
+});
 
 // Accept raw image/jpeg body
 app.post(
@@ -59,6 +92,23 @@ app.post(
                 streamifier.createReadStream(buffer).pipe(uploadStream);
             });
 
+            // Save Cloudinary URL + metadata to MongoDB (do NOT store binary buffer)
+            let savedDoc = null;
+            try {
+                const imgDoc = new Image({
+                    deviceId,
+                    url: uploadResult.secure_url,
+                    public_id: uploadResult.public_id,
+                    width: uploadResult.width,
+                    height: uploadResult.height,
+                    bytes: uploadResult.bytes,
+                });
+                savedDoc = await imgDoc.save();
+                console.log("Saved image metadata to MongoDB, id=", savedDoc._id.toString());
+            } catch (saveErr) {
+                console.warn("Failed to save image metadata to MongoDB:", saveErr?.message || saveErr);
+            }
+
             // Optionally send Telegram notification with Cloudinary URL
             const tgToken = process.env.TELEGRAM_BOT_TOKEN;
             const tgChat = process.env.TELEGRAM_CHAT_ID;
@@ -83,15 +133,20 @@ app.post(
                 }
             }
 
-            // Respond with uploaded URL and metadata
-            return res.json({
+            // Respond with uploaded URL, metadata and MongoDB id/timestamp when available
+            const resp = {
                 ok: true,
                 url: uploadResult.secure_url,
                 public_id: uploadResult.public_id,
                 width: uploadResult.width,
                 height: uploadResult.height,
                 bytes: uploadResult.bytes,
-            });
+            };
+            if (savedDoc) {
+                resp.imageId = savedDoc._id;
+                resp.savedAt = savedDoc.createdAt || savedDoc._id.getTimestamp?.();
+            }
+            return res.json(resp);
         } catch (err) {
             console.error("Upload error:", err);
             return res.status(500).json({ error: String(err) });
